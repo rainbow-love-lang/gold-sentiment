@@ -18,6 +18,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main            # re-run時でもdetached HEADにならない
+          fetch-depth: 0       # rebaseが必要になった時のために履歴を持つ
 
       - uses: actions/setup-python@v5
         with:
@@ -45,9 +48,10 @@ jobs:
           fi
           git commit -m "update $(date -u +%Y-%m-%dT%H:%MZ)"
           for i in 1 2 3; do
-            git push && exit 0
+            git push origin HEAD:main && exit 0
             echo "push failed, retry $i"
-            git pull --rebase --autostash || true
+            git fetch origin main
+            git rebase origin/main || git rebase --abort || true
             sleep 5
           done
           exit 1
