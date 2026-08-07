@@ -10,9 +10,17 @@ EMAIL    = os.environ["MYFXBOOK_EMAIL"].strip()
 PASSWORD = os.environ["MYFXBOOK_PASSWORD"].strip()
 BASE     = "https://www.myfxbook.com/api"
 SYMBOLS  = ["XAUUSD"]                                   # 増やすならここに追記
-STOOQ    = {"XAUUSD": "xauusd", "XAGUSD": "xagusd"}     # 価格取得用のコード対応表
 CSV_PATH = "positionbook.csv"
 UA       = {"User-Agent": "gold-sentiment/1.0"}
+BROWSER  = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/126.0.0.0 Safari/537.36")}
+
+# 価格取得の優先順位。上から順に試して最初に成功したものを採用する
+PRICE_SOURCES = {
+    "XAUUSD": [("stooq", "xauusd"), ("yahoo", "XAUUSD=X"), ("yahoo", "GC=F")],
+    "XAGUSD": [("stooq", "xagusd"), ("yahoo", "XAGUSD=X"), ("yahoo", "SI=F")],
+}
 
 FIELDS = [
     "snapshot_time", "instrument", "price",
@@ -63,18 +71,33 @@ def outlook(session):
     return api("get-community-outlook.json", {"session": session}).get("symbols") or []
 
 
-def stooq_price(inst):
-    """価格は取れなくても致命的でないので、失敗は空欄で返す"""
-    code = STOOQ.get(inst, inst.lower())
-    try:
-        r = requests.get("https://stooq.com/q/l/",
-                         params={"s": code, "f": "sd2t2ohlcv", "h": "", "e": "csv"},
-                         headers=UA, timeout=15)
-        r.raise_for_status()
-        return round(float(next(csv.DictReader(r.text.splitlines()))["Close"]), 3)
-    except Exception as e:
-        print(f"[warn] stooq {code}: {e}")
-        return ""
+def price_stooq(code):
+    # 為替・貴金属は出来高を持たないため f に v を含めない（含めると404）
+    r = requests.get("https://stooq.com/q/l/",
+                     params={"s": code, "f": "sd2t2ohlc", "h": "", "e": "csv"},
+                     headers=BROWSER, timeout=15)
+    r.raise_for_status()
+    return float(next(csv.DictReader(r.text.splitlines()))["Close"])
+
+
+def price_yahoo(code):
+    r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{code}",
+                     params={"interval": "1d", "range": "1d"},
+                     headers=BROWSER, timeout=15)
+    r.raise_for_status()
+    return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+
+
+def get_price(inst):
+    """価格は補助情報。全ソース失敗しても空欄で返し、採取自体は止めない"""
+    for kind, code in PRICE_SOURCES.get(inst, [("stooq", inst.lower())]):
+        try:
+            v = price_stooq(code) if kind == "stooq" else price_yahoo(code)
+            print(f"price {inst} <- {kind}:{code} = {v}")
+            return round(v, 3)
+        except Exception as e:
+            print(f"[warn] price {kind}:{code}: {e}")
+    return ""
 
 
 def num(v):
@@ -127,7 +150,7 @@ def main():
         logout(session)
 
     found = {s.get("name"): s for s in symbols}
-    print("available:", ", ".join(sorted(k for k in found if k)))
+    print(f"symbols fetched: {len(found)}")
 
     rows = []
     for inst in SYMBOLS:
@@ -149,7 +172,7 @@ def main():
         rows.append({
             "snapshot_time":   stamp,
             "instrument":      inst,
-            "price":           stooq_price(inst),
+            "price":           get_price(inst),
             "long_pct":        lo,
             "short_pct":       sh,
             "net_pct":         round(lo - sh, 2),
