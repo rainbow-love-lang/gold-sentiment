@@ -2,6 +2,7 @@ import csv
 import os
 import time
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 import requests
 
@@ -43,7 +44,12 @@ def api(path, params, attempts=3):
 
 
 def login():
-    return api("login.json", {"email": EMAIL, "password": PASSWORD})["session"]
+    raw = api("login.json", {"email": EMAIL, "password": PASSWORD})["session"]
+    # Myfxbookはsessionをエンコード済みの文字列で返す。
+    # そのまま渡すとrequestsが % を %25 に二重エンコードし "Invalid session." になる
+    session = unquote(raw)
+    print("login ok")
+    return session
 
 
 def logout(session):
