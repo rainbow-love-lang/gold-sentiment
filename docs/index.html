@@ -14,20 +14,20 @@
 <div class="meta">Net＝(ロング数量−ショート数量)÷合計×100。プラスは買い持ち優勢。<br>
 破線はリテールの平均建値（＝ストップが溜まりやすい帯）。時刻はJST。</div>
 <h2>XAUUSD</h2>
-<div class="val">08/07 12:00 JST ／ Net <b>-18.42</b>％ ／ 価格 <b></b><br>
-ロング 41.0％・ショート 59.0％ ／ 平均建値 L 4455.4343・S 4077.9275</div>
+<div class="val">08/07 14:00 JST ／ Net <b>-18.65</b>％ ／ 価格 <b>4329.1</b><br>
+ロング 41.0％・ショート 59.0％ ／ 平均建値 L 4456.1598・S 4078.6355</div>
 <div class="wrap"><canvas id="c_XAUUSD"></canvas></div>
 <script>
 new Chart(document.getElementById("c_XAUUSD"), {
   type:"line",
-  data:{ labels:["08/07 12:00"], datasets:[
-    {label:"Net (L-S) %", data:[-18.42], yAxisID:"y",
+  data:{ labels:["08/07 12:00", "08/07 14:00"], datasets:[
+    {label:"Net (L-S) %", data:[-18.42, -18.65], yAxisID:"y",
       borderColor:"#4ea1ff", borderWidth:2, pointRadius:0, tension:.2, spanGaps:true},
-    {label:"Price", data:[null], yAxisID:"y1",
+    {label:"Price", data:[null, 4329.1], yAxisID:"y1",
       borderColor:"#ffb74d", borderWidth:1.6, pointRadius:0, tension:.2, spanGaps:true},
-    {label:"平均L建値", data:[4455.4343], yAxisID:"y1",
+    {label:"平均L建値", data:[4455.4343, 4456.1598], yAxisID:"y1",
       borderColor:"#66bb6a", borderWidth:1, borderDash:[4,3], pointRadius:0, spanGaps:true},
-    {label:"平均S建値", data:[4077.9275], yAxisID:"y1",
+    {label:"平均S建値", data:[4077.9275, 4078.6355], yAxisID:"y1",
       borderColor:"#ef5350", borderWidth:1, borderDash:[4,3], pointRadius:0, spanGaps:true}
   ]},
   options:{ responsive:true, maintainAspectRatio:false,

@@ -1,2 +1,3 @@
 snapshot_time,instrument,price,long_pct,short_pct,net_pct,long_ratio,long_vol,short_vol,net_vol_pct,long_positions,short_positions,avg_long_price,avg_short_price,fetched_at
 2026-08-07T03:00:00+00:00,XAUUSD,,41.0,59.0,-18.0,41.0,801.82,1163.9,-18.42,7787,7934,4455.4343,4077.9275,2026-08-07T03:24:41+00:00
+2026-08-07T05:00:00+00:00,XAUUSD,4329.1,41.0,59.0,-18.0,41.0,801.88,1169.67,-18.65,7764,7964,4456.1598,4078.6355,2026-08-07T05:42:26+00:00
