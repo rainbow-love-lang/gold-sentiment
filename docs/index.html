@@ -13,6 +13,8 @@ margin:8px 0 10px;border-radius:4px}
 .label{font-size:16px;font-weight:bold;color:#fff}
 .tags{font-size:12px;color:#ffb74d;margin-top:4px;line-height:1.6}
 .note{font-size:12px;color:#999;margin-top:6px;line-height:1.6}
+.diag{font-size:11px;color:#6d6d6d;margin-top:8px;padding-top:7px;
+border-top:1px solid #2a2a2a;line-height:1.6}
 .wrap{position:relative;height:54vh;margin-bottom:26px}
 b{color:#fff}
 </style></head><body>
@@ -25,10 +27,14 @@ b{color:#fff}
 ロング 43.0％・ショート 57.0％ ／ 平均建値 L 4485.6・S 4115.2</div>
 <div class="card">
 <div class="label">【動意なし】</div>
-<div class="tags">［新規流入L↓］　［新規流入S↑］</div>
+<div class="tags">－</div>
 <div class="note">建玉に目立った動きなし<br>
+Δ建玉（3点前比・閾値±2%）：ロング <b>-1.01%</b>　ショート <b>-1.94%</b><br>
 ロング勢 <b>-147.9</b>　ショート勢 <b>-222.5</b><br>
-仮説の一致率：直近30回 1/3（33%） ／ 全期間 1/3（33%）</div>
+仮説の一致率：直近30回 集計中（1/3） ／ 全期間 集計中（1/3）</div>
+<div class="diag">検証の内訳：判定64点 → 方向あり10点 → 検証3点
+（方向なしで除外54点／価格が±0.15%未満で除外7点）<br>
+|Δ建玉|の分布（動きのあった点のみ）：L 中央値4.54%・上位25%9.79%・閾値超え14/25点 ／ S 中央値2.92%・上位25%6.52%・閾値超え17/25点</div>
 </div>
 <div class="wrap"><canvas id="c_XAUUSD"></canvas></div>
 <script>
