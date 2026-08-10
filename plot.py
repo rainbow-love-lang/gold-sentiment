@@ -14,9 +14,10 @@ COLLAPSE_MIN = 3        # 同値がこの行数以上続いたら畳む
 LOOKBACK = 3            # 何点前と比較するか
 VOL_THR = 0.02          # 建玉量が±2%動いたら「増減あり」
 PRICE_THR = 0.0015      # 価格が±0.15%動いたら「上下あり」
-AVG_THR = 0.0003        # 平均建値が±0.03%動いたら「新規流入」
+AVG_THR = 0.0003        # 平均建値が±0.03%動いたら「動きあり」
 NEAR_DIST = 30.0        # 建値帯への接近と見なす距離（ドル）
 RECENT_N = 30           # 一致率の直近集計数
+MIN_N_FOR_RATE = 20     # 母数がこれ未満のときは％を出さない
 
 # 無変化の判定に使う列。価格は含めない
 # （相場が止まっていてもスポットAPIが微差を返しうるため）
@@ -37,6 +38,8 @@ margin:8px 0 10px;border-radius:4px}
 .label{font-size:16px;font-weight:bold;color:#fff}
 .tags{font-size:12px;color:#ffb74d;margin-top:4px;line-height:1.6}
 .note{font-size:12px;color:#999;margin-top:6px;line-height:1.6}
+.diag{font-size:11px;color:#6d6d6d;margin-top:8px;padding-top:7px;
+border-top:1px solid #2a2a2a;line-height:1.6}
 .wrap{position:relative;height:54vh;margin-bottom:26px}
 b{color:#fff}
 </style></head><body>
@@ -64,6 +67,11 @@ def fnum(v):
 def fmt(v, nd=1):
     n = fnum(v)
     return f"{n:.{nd}f}" if n is not None else "-"
+
+
+def pct(r, nd=1):
+    """相対変化率を符号つき％で表示"""
+    return f"{r * 100:+.{nd}f}%" if r is not None else "-"
 
 
 def still_key(r):
@@ -118,11 +126,18 @@ def last_valid(seq):
 
 # ---------- 判定 ----------
 
-def dir3(cur, prev, thr):
-    """相対変化から +1 / 0 / -1 を返す。判定不能はNone"""
+def rel(cur, prev):
+    """相対変化率を返す。判定不能はNone"""
     if cur is None or prev is None or prev == 0:
         return None
-    r = (cur - prev) / abs(prev)
+    return (cur - prev) / abs(prev)
+
+
+def dir3(cur, prev, thr):
+    """相対変化から +1 / 0 / -1 を返す。判定不能はNone"""
+    r = rel(cur, prev)
+    if r is None:
+        return None
     if r > thr:
         return 1
     if r < -thr:
@@ -144,28 +159,55 @@ VERDICT = {
 }
 
 
+def flow_tag(side, d_avg, d_vol, price, avg):
+    """平均建値の動きだけでは新規か決済か決まらないため、
+    建玉量の増減と「現値が平均建値のどちら側にあるか」を併用して切り分ける。
+    新規注文は現値で入るので、平均は必ず現値の側へ引かれる。"""
+    if None in (d_avg, d_vol, price, avg) or d_avg == 0 or price == avg:
+        return None
+    # 平均が現値へ近づいたか
+    toward = (d_avg > 0) == (price > avg)
+    if toward and d_vol > 0:
+        return f"新規流入{side}"
+    if toward and d_vol < 0:
+        return f"{side}深い建玉が撤退"
+    if (not toward) and d_vol < 0:
+        return f"{side}浅い建玉が撤退"
+    if (not toward) and d_vol > 0:
+        return f"{side}建値が現値と逆行"
+    return None   # 建玉量が横ばいのときは判断を保留
+
+
 def judge(rows, i):
     """rows[i] 時点の判定。判定不能ならNone"""
     if i < LOOKBACK:
         return None
     cur, prev = rows[i], rows[i - LOOKBACK]
 
-    dl = dir3(fnum(cur.get("long_vol")), fnum(prev.get("long_vol")), VOL_THR)
-    ds = dir3(fnum(cur.get("short_vol")), fnum(prev.get("short_vol")), VOL_THR)
-    if dl is None or ds is None:
+    rl = rel(fnum(cur.get("long_vol")), fnum(prev.get("long_vol")))
+    rs_ = rel(fnum(cur.get("short_vol")), fnum(prev.get("short_vol")))
+    if rl is None or rs_ is None:
         return None
 
+    def to_dir(r):
+        return 1 if r > VOL_THR else (-1 if r < -VOL_THR else 0)
+
+    dl, ds = to_dir(rl), to_dir(rs_)
     label, bias, desc = VERDICT[(dl, ds)]
     tags = []
 
-    # 新規流入：平均建値が動いていれば決済ではなく新規参入
-    for key, side in (("avg_long_price", "L"), ("avg_short_price", "S")):
-        d = dir3(fnum(cur.get(key)), fnum(prev.get(key)), AVG_THR)
-        if d:
-            tags.append(f"新規流入{side}{'↑' if d > 0 else '↓'}")
-
     p = ref_price(cur)
     al, as_ = fnum(cur.get("avg_long_price")), fnum(cur.get("avg_short_price"))
+
+    # 新規参入か手仕舞いかの切り分け
+    for key, side, avg, dv in (
+        ("avg_long_price", "L", al, dl),
+        ("avg_short_price", "S", as_, ds),
+    ):
+        d_avg = dir3(fnum(cur.get(key)), fnum(prev.get(key)), AVG_THR)
+        t = flow_tag(side, d_avg, dv, p, avg)
+        if t:
+            tags.append(t)
 
     # 建値帯への接近と突破
     if p is not None:
@@ -189,27 +231,66 @@ def judge(rows, i):
         elif n <= min(nets):
             tags.append("偏り極大（売り側）")
 
-    return {"label": label, "bias": bias, "desc": desc, "tags": tags}
+    return {"label": label, "bias": bias, "desc": desc, "tags": tags,
+            "d_long": rl, "d_short": rs_}
 
 
 def verify(rows, judges):
-    """各判定の1点後の値動きと突き合わせる。(的中, 判定総数) のリスト"""
+    """各判定の1点後の値動きと突き合わせる。
+    (的中リスト, 除外の内訳) を返す"""
     out = []
+    skip_bias = skip_flat = 0
     for i, j in enumerate(judges):
-        if not j or not j["bias"] or i + 1 >= len(rows):
+        if not j:
+            continue
+        if not j["bias"]:
+            skip_bias += 1
+            continue
+        if i + 1 >= len(rows):
             continue
         d = dir3(ref_price(rows[i + 1]), ref_price(rows[i]), PRICE_THR)
         if not d:          # 価格が動いていない／判定不能はカウントしない
+            skip_flat += 1
             continue
         out.append((d > 0) == (j["bias"] == "buy"))
-    return out
+    return out, {"bias": skip_bias, "flat": skip_flat}
 
 
 def rate(hits):
-    if not hits:
-        return "集計中"
+    """母数が小さいうちは％を出さない。偶然と区別がつかないため"""
+    n = len(hits)
+    if n == 0:
+        return "集計中（n=0）"
     ok = sum(1 for h in hits if h)
-    return f"{ok}/{len(hits)}（{ok / len(hits) * 100:.0f}%）"
+    if n < MIN_N_FOR_RATE:
+        return f"集計中（{ok}/{n}）"
+    return f"{ok}/{n}（{ok / n * 100:.0f}%）"
+
+
+def vol_stats(rows, key):
+    """|Δ建玉| の分布。閾値VOL_THRが妥当かを見るための材料。
+    週末など完全に動かない点は除外する"""
+    vals = []
+    for i in range(LOOKBACK, len(rows)):
+        r = rel(fnum(rows[i].get(key)), fnum(rows[i - LOOKBACK].get(key)))
+        if r is not None and r != 0:
+            vals.append(abs(r))
+    if not vals:
+        return None
+    vals.sort()
+
+    def q(p):
+        return vals[min(len(vals) - 1, int(len(vals) * p))]
+
+    return {"n": len(vals), "med": q(0.5), "p75": q(0.75),
+            "over": sum(1 for v in vals if v > VOL_THR)}
+
+
+def stat_line(vs, side):
+    if not vs:
+        return f"{side} －"
+    return (f"{side} 中央値{vs['med'] * 100:.2f}%・上位25%{vs['p75'] * 100:.2f}%・"
+            f"閾値超え{vs['over']}/{vs['n']}点")
 
 
 def net_range(values):
@@ -252,13 +333,19 @@ html = HEAD
 for inst, all_rows in by_inst.items():
     # 判定は全行で行う（検証の母数を減らさないため）
     judges = [judge(all_rows, i) for i in range(len(all_rows))]
-    hits = verify(all_rows, judges)
+    hits, skipped = verify(all_rows, judges)
     cur = next((j for j in reversed(judges) if j), None)
+
+    n_judged = sum(1 for j in judges if j)
+    n_bias = sum(1 for j in judges if j and j["bias"])
+    vsl = vol_stats(all_rows, "long_vol")
+    vss = vol_stats(all_rows, "short_vol")
 
     # グラフは圧縮後の点を使う
     rs = collapse(all_rows)[-MAX_POINTS:]
     print(f"{inst}: {len(all_rows)} rows -> {len(rs)} points, "
-          f"judged {sum(1 for j in judges if j)}, verified {len(hits)}")
+          f"judged {n_judged}, bias {n_bias}, verified {len(hits)}, "
+          f"skipped bias={skipped['bias']} flat={skipped['flat']}")
 
     last = rs[-1]
     labels = [
@@ -293,8 +380,12 @@ for inst, all_rows in by_inst.items():
 <div class="label">【{cur['label']}】</div>
 <div class="tags">{'　'.join('［' + t + '］' for t in cur['tags']) or '－'}</div>
 <div class="note">{cur['desc']}<br>
+Δ建玉（{LOOKBACK}点前比・閾値±{VOL_THR * 100:.0f}%）：ロング <b>{pct(cur['d_long'], 2)}</b>　ショート <b>{pct(cur['d_short'], 2)}</b><br>
 {pl}　{ps}<br>
 仮説の一致率：直近{RECENT_N}回 {rate(hits[-RECENT_N:])} ／ 全期間 {rate(hits)}</div>
+<div class="diag">検証の内訳：判定{n_judged}点 → 方向あり{n_bias}点 → 検証{len(hits)}点
+（方向なしで除外{skipped['bias']}点／価格が±{PRICE_THR * 100:.2f}%未満で除外{skipped['flat']}点）<br>
+|Δ建玉|の分布（動きのあった点のみ）：{stat_line(vsl, 'L')} ／ {stat_line(vss, 'S')}</div>
 </div>"""
     else:
         card = '<div class="card"><div class="note">判定に必要なデータが不足しています。</div></div>'
