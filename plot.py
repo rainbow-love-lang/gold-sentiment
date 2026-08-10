@@ -9,15 +9,18 @@ JST = timezone(timedelta(hours=9))
 
 NET_MIN_SPAN = 6.0      # Net軸の最低表示幅（%）
 NET_PAD_RATIO = 0.15    # データ範囲に対する上下の余白比
-COLLAPSE_MIN = 3        # 同値がこの行数以上続いたら畳む
+COLLAPSE_MIN = 3        # 同値がこの行数以上続いたら畳む／市場停止と見なす
 
 LOOKBACK = 3            # 何点前と比較するか
 VOL_THR = 0.02          # 建玉量が±2%動いたら「増減あり」
-PRICE_THR = 0.0015      # 価格が±0.15%動いたら「上下あり」
+PRICE_THR = 0.0015      # 価格が±0.15%動いたら「上下あり」（3本とも共通）
 AVG_THR = 0.0003        # 平均建値が±0.03%動いたら「動きあり」
 NEAR_DIST = 30.0        # 建値帯への接近と見なす距離（ドル）
-RECENT_N = 30           # 一致率の直近集計数
 MIN_N_FOR_RATE = 20     # 母数がこれ未満のときは％を出さない
+
+# 検証ホライズン。採取が毎時なので 1行＝1時間
+# チャートで一般に使われる時間軸に合わせている
+HORIZONS = ((1, "1時間"), (4, "4時間"), (24, "1日"))
 
 # 無変化の判定に使う列。価格は含めない
 # （相場が止まっていてもスポットAPIが微差を返しうるため）
@@ -57,6 +60,14 @@ def jst(iso, fmt="%m/%d %H:%M"):
         return iso
 
 
+def ts(r):
+    """snapshot_time を datetime に。失敗はNone"""
+    try:
+        return datetime.fromisoformat(r.get("snapshot_time", ""))
+    except Exception:
+        return None
+
+
 def fnum(v):
     try:
         return float(v)
@@ -76,6 +87,24 @@ def pct(r, nd=1):
 
 def still_key(r):
     return tuple((r.get(k) or "").strip() for k in STILL_KEYS)
+
+
+def frozen_flags(rs):
+    """建玉が動かない連続ブロック（週末・市場停止）に含まれる行にTrueを立てる。
+    ブロック先頭は「動いていた最後の値」なので生かし、以降の重複行だけを停止扱いにする"""
+    flags = [False] * len(rs)
+    i = 0
+    n = len(rs)
+    while i < n:
+        j = i + 1
+        key = still_key(rs[i])
+        while j < n and still_key(rs[j]) == key:
+            j += 1
+        if j - i >= COLLAPSE_MIN:
+            for k in range(i + 1, j):
+                flags[k] = True
+        i = j
+    return flags
 
 
 def collapse(rs):
@@ -165,8 +194,7 @@ def flow_tag(side, d_avg, d_vol, price, avg):
     新規注文は現値で入るので、平均は必ず現値の側へ引かれる。"""
     if None in (d_avg, d_vol, price, avg) or d_avg == 0 or price == avg:
         return None
-    # 平均が現値へ近づいたか
-    toward = (d_avg > 0) == (price > avg)
+    toward = (d_avg > 0) == (price > avg)   # 平均が現値へ近づいたか
     if toward and d_vol > 0:
         return f"新規流入{side}"
     if toward and d_vol < 0:
@@ -235,25 +263,42 @@ def judge(rows, i):
             "d_long": rl, "d_short": rs_}
 
 
-def verify(rows, judges):
-    """各判定の1点後の値動きと突き合わせる。
+def window_ok(i, k, h, times, frozen):
+    """判定時点iからk（=i+h）までの窓が検証に使えるかを見る。
+    ・欠測で行が飛んでいれば経過時間がh時間からずれる
+    ・週末など市場停止をまたぐ窓は、止まった価格と比較することになる"""
+    ti, tk = times[i], times[k]
+    if ti is None or tk is None:
+        return False
+    if abs((tk - ti).total_seconds() - h * 3600) > 60:
+        return False
+    return not any(frozen[x] for x in range(i, k + 1))
+
+
+def verify(rows, judges, h, times, frozen):
+    """判定のh時間後の値動きと突き合わせる。
     (的中リスト, 除外の内訳) を返す"""
     out = []
-    skip_bias = skip_flat = 0
+    st = {"bias": 0, "pending": 0, "gap": 0, "flat": 0}
     for i, j in enumerate(judges):
         if not j:
             continue
         if not j["bias"]:
-            skip_bias += 1
+            st["bias"] += 1
             continue
-        if i + 1 >= len(rows):
+        k = i + h
+        if k >= len(rows):
+            st["pending"] += 1      # まだ将来が確定していない
             continue
-        d = dir3(ref_price(rows[i + 1]), ref_price(rows[i]), PRICE_THR)
-        if not d:          # 価格が動いていない／判定不能はカウントしない
-            skip_flat += 1
+        if not window_ok(i, k, h, times, frozen):
+            st["gap"] += 1
+            continue
+        d = dir3(ref_price(rows[k]), ref_price(rows[i]), PRICE_THR)
+        if not d:                   # 価格が動いていない／判定不能
+            st["flat"] += 1
             continue
         out.append((d > 0) == (j["bias"] == "buy"))
-    return out, {"bias": skip_bias, "flat": skip_flat}
+    return out, st
 
 
 def rate(hits):
@@ -333,19 +378,30 @@ html = HEAD
 for inst, all_rows in by_inst.items():
     # 判定は全行で行う（検証の母数を減らさないため）
     judges = [judge(all_rows, i) for i in range(len(all_rows))]
-    hits, skipped = verify(all_rows, judges)
     cur = next((j for j in reversed(judges) if j), None)
+
+    times = [ts(r) for r in all_rows]
+    frozen = frozen_flags(all_rows)
+
+    res = {}
+    for h, name in HORIZONS:
+        hits, st = verify(all_rows, judges, h, times, frozen)
+        res[h] = {"hits": hits, "st": st}
 
     n_judged = sum(1 for j in judges if j)
     n_bias = sum(1 for j in judges if j and j["bias"])
+    n_frozen = sum(1 for f in frozen if f)
     vsl = vol_stats(all_rows, "long_vol")
     vss = vol_stats(all_rows, "short_vol")
 
     # グラフは圧縮後の点を使う
     rs = collapse(all_rows)[-MAX_POINTS:]
     print(f"{inst}: {len(all_rows)} rows -> {len(rs)} points, "
-          f"judged {n_judged}, bias {n_bias}, verified {len(hits)}, "
-          f"skipped bias={skipped['bias']} flat={skipped['flat']}")
+          f"judged {n_judged}, bias {n_bias}, frozen {n_frozen}")
+    for h, name in HORIZONS:
+        s = res[h]["st"]
+        print(f"  {name}: verified {len(res[h]['hits'])}, "
+              f"pending {s['pending']}, gap {s['gap']}, flat {s['flat']}")
 
     last = rs[-1]
     labels = [
@@ -375,6 +431,15 @@ for inst, all_rows in by_inst.items():
     pl = f"ロング勢 <b>{ls - la:+.1f}</b>" if (ls is not None and la is not None) else ""
     ps = f"ショート勢 <b>{sa - ls:+.1f}</b>" if (ls is not None and sa is not None) else ""
 
+    hz_txt = " ／ ".join(f"{name} {rate(res[h]['hits'])}" for h, name in HORIZONS)
+    diag_hz = "<br>".join(
+        f"　{name}後：検証<b>{len(res[h]['hits'])}</b>点"
+        f"（未確定{res[h]['st']['pending']}"
+        f"／窓の欠落{res[h]['st']['gap']}"
+        f"／価格±{PRICE_THR * 100:.2f}%未満{res[h]['st']['flat']}）"
+        for h, name in HORIZONS
+    )
+
     if cur:
         card = f"""<div class="card">
 <div class="label">【{cur['label']}】</div>
@@ -382,9 +447,9 @@ for inst, all_rows in by_inst.items():
 <div class="note">{cur['desc']}<br>
 Δ建玉（{LOOKBACK}点前比・閾値±{VOL_THR * 100:.0f}%）：ロング <b>{pct(cur['d_long'], 2)}</b>　ショート <b>{pct(cur['d_short'], 2)}</b><br>
 {pl}　{ps}<br>
-仮説の一致率：直近{RECENT_N}回 {rate(hits[-RECENT_N:])} ／ 全期間 {rate(hits)}</div>
-<div class="diag">検証の内訳：判定{n_judged}点 → 方向あり{n_bias}点 → 検証{len(hits)}点
-（方向なしで除外{skipped['bias']}点／価格が±{PRICE_THR * 100:.2f}%未満で除外{skipped['flat']}点）<br>
+仮説の一致率：{hz_txt}</div>
+<div class="diag">検証の内訳：判定{n_judged}点（うち市場停止{n_frozen}点） → 方向あり{n_bias}点<br>
+{diag_hz}<br>
 |Δ建玉|の分布（動きのあった点のみ）：{stat_line(vsl, 'L')} ／ {stat_line(vss, 'S')}</div>
 </div>"""
     else:
