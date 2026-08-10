@@ -4,11 +4,16 @@ from datetime import datetime, timedelta, timezone
 
 CSV_PATH = "positionbook.csv"
 OUT_DIR = "docs"
-MAX_POINTS = 336        # 毎時1点で約14日分
+MAX_POINTS = 336        # 畳んだ後の点数の上限
 JST = timezone(timedelta(hours=9))
 
 NET_MIN_SPAN = 6.0      # Net軸の最低表示幅（%）
 NET_PAD_RATIO = 0.15    # データ範囲に対する上下の余白比
+COLLAPSE_MIN = 3        # 同値がこの行数以上続いたら畳む
+
+# 無変化の判定に使う列。価格は含めない
+# （相場が止まっていてもスポットAPIが微差を返しうるため）
+STILL_KEYS = ("net_vol_pct", "avg_long_price", "avg_short_price")
 
 HEAD = """<!doctype html><html lang="ja"><head>
 <meta charset="utf-8">
@@ -24,7 +29,8 @@ h2{font-size:17px;margin:18px 0 2px}
 b{color:#fff}
 </style></head><body>
 <div class="meta">Net＝(ロング数量−ショート数量)÷合計×100。プラスは買い持ち優勢。<br>
-破線はリテールの平均建値（＝ストップが溜まりやすい帯）。価格はスポット基準。時刻はJST。</div>
+破線はリテールの平均建値（＝ストップが溜まりやすい帯）。価格はスポット基準。時刻はJST。<br>
+建玉が動かない時間帯（週末など）は圧縮表示。ラベルの「〜」は時間が飛んでいる箇所。</div>
 """
 
 
@@ -45,6 +51,33 @@ def fnum(v):
 def fmt(v, nd=1):
     n = fnum(v)
     return f"{n:.{nd}f}" if n is not None else "-"
+
+
+def still_key(r):
+    return tuple((r.get(k) or "").strip() for k in STILL_KEYS)
+
+
+def collapse(rs):
+    """建玉が動かない連続ブロックを最初と最後の2点に畳む。
+    畳んだブロックの先頭行には _gap（間引いた行数）を立てる"""
+    out = []
+    i = 0
+    n = len(rs)
+    while i < n:
+        j = i + 1
+        key = still_key(rs[i])
+        while j < n and still_key(rs[j]) == key:
+            j += 1
+        block = rs[i:j]
+        if len(block) >= COLLAPSE_MIN:
+            head = dict(block[0])
+            head["_gap"] = len(block) - 2
+            out.append(head)
+            out.append(dict(block[-1]))
+        else:
+            out.extend(dict(b) for b in block)
+        i = j
+    return out
 
 
 def split_price(r):
@@ -103,9 +136,15 @@ for r in rows:
 
 html = HEAD
 for inst, rs in by_inst.items():
-    rs = rs[-MAX_POINTS:]
+    raw_n = len(rs)
+    rs = collapse(rs)[-MAX_POINTS:]
+    print(f"{inst}: {raw_n} rows -> {len(rs)} points")
+
     last = rs[-1]
-    labels = [jst(r.get("snapshot_time", "")) for r in rs]
+    labels = [
+        jst(r.get("snapshot_time", "")) + (" 〜" if r.get("_gap") else "")
+        for r in rs
+    ]
     net = [
         fnum(r.get("net_vol_pct"))
         if fnum(r.get("net_vol_pct")) is not None
