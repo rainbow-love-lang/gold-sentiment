@@ -11,6 +11,13 @@ NET_MIN_SPAN = 6.0      # Net軸の最低表示幅（%）
 NET_PAD_RATIO = 0.15    # データ範囲に対する上下の余白比
 COLLAPSE_MIN = 3        # 同値がこの行数以上続いたら畳む
 
+LOOKBACK = 3            # 何点前と比較するか
+VOL_THR = 0.02          # 建玉量が±2%動いたら「増減あり」
+PRICE_THR = 0.0015      # 価格が±0.15%動いたら「上下あり」
+AVG_THR = 0.0003        # 平均建値が±0.03%動いたら「新規流入」
+NEAR_DIST = 30.0        # 建値帯への接近と見なす距離（ドル）
+RECENT_N = 30           # 一致率の直近集計数
+
 # 無変化の判定に使う列。価格は含めない
 # （相場が止まっていてもスポットAPIが微差を返しうるため）
 STILL_KEYS = ("net_vol_pct", "avg_long_price", "avg_short_price")
@@ -25,12 +32,18 @@ body{background:#111;color:#eee;font-family:system-ui,sans-serif;margin:0;paddin
 h2{font-size:17px;margin:18px 0 2px}
 .meta{font-size:12px;color:#999;margin-bottom:10px;line-height:1.6}
 .val{font-size:13px;color:#ccc;margin:0 0 8px;line-height:1.7}
+.card{background:#1a1a1a;border-left:3px solid #4ea1ff;padding:10px 12px;
+margin:8px 0 10px;border-radius:4px}
+.label{font-size:16px;font-weight:bold;color:#fff}
+.tags{font-size:12px;color:#ffb74d;margin-top:4px;line-height:1.6}
+.note{font-size:12px;color:#999;margin-top:6px;line-height:1.6}
 .wrap{position:relative;height:54vh;margin-bottom:26px}
 b{color:#fff}
 </style></head><body>
 <div class="meta">Net＝(ロング数量−ショート数量)÷合計×100。プラスは買い持ち優勢。<br>
 破線はリテールの平均建値（＝ストップが溜まりやすい帯）。価格はスポット基準。時刻はJST。<br>
-建玉が動かない時間帯（週末など）は圧縮表示。ラベルの「〜」は時間が飛んでいる箇所。</div>
+建玉が動かない時間帯（週末など）は圧縮表示。ラベルの「〜」は時間が飛んでいる箇所。<br>
+判定は「リテールと価格は逆相関する」という仮説に基づく検証用の表示です。</div>
 """
 
 
@@ -58,8 +71,7 @@ def still_key(r):
 
 
 def collapse(rs):
-    """建玉が動かない連続ブロックを最初と最後の2点に畳む。
-    畳んだブロックの先頭行には _gap（間引いた行数）を立てる"""
+    """建玉が動かない連続ブロックを最初と最後の2点に畳む"""
     out = []
     i = 0
     n = len(rs)
@@ -91,11 +103,113 @@ def split_price(r):
     return None, (f if f is not None else p)
 
 
+def ref_price(r):
+    """判定に使う価格。スポット優先、無ければ先物で代用"""
+    s, f = split_price(r)
+    return s if s is not None else f
+
+
 def last_valid(seq):
     for v in reversed(seq):
         if v is not None:
             return v
     return None
+
+
+# ---------- 判定 ----------
+
+def dir3(cur, prev, thr):
+    """相対変化から +1 / 0 / -1 を返す。判定不能はNone"""
+    if cur is None or prev is None or prev == 0:
+        return None
+    r = (cur - prev) / abs(prev)
+    if r > thr:
+        return 1
+    if r < -thr:
+        return -1
+    return 0
+
+
+# (Δロング量, Δショート量) -> (ラベル, 想定方向, 説明)
+VERDICT = {
+    (1, 0):   ("売り目線", "sell", "買いが溜まっている＝下落の燃料"),
+    (1, -1):  ("売り目線（両側）", "sell", "買い増加かつ売り減少。偏りが加速"),
+    (0, 1):   ("買い目線", "buy", "売りが溜まっている＝上昇の燃料"),
+    (-1, 1):  ("買い目線（両側）", "buy", "売り増加かつ買い減少。偏りが加速"),
+    (-1, 0):  ("燃料消費・下落側", None, "ロングが投げている最中"),
+    (0, -1):  ("燃料消費・上昇側", None, "ショートが焼かれている最中"),
+    (1, 1):   ("対立激化", None, "総建玉が膨張。どちらかが必ず焼かれる"),
+    (-1, -1): ("手仕舞い", None, "両者が撤退。材料に乏しい"),
+    (0, 0):   ("動意なし", None, "建玉に目立った動きなし"),
+}
+
+
+def judge(rows, i):
+    """rows[i] 時点の判定。判定不能ならNone"""
+    if i < LOOKBACK:
+        return None
+    cur, prev = rows[i], rows[i - LOOKBACK]
+
+    dl = dir3(fnum(cur.get("long_vol")), fnum(prev.get("long_vol")), VOL_THR)
+    ds = dir3(fnum(cur.get("short_vol")), fnum(prev.get("short_vol")), VOL_THR)
+    if dl is None or ds is None:
+        return None
+
+    label, bias, desc = VERDICT[(dl, ds)]
+    tags = []
+
+    # 新規流入：平均建値が動いていれば決済ではなく新規参入
+    for key, side in (("avg_long_price", "L"), ("avg_short_price", "S")):
+        d = dir3(fnum(cur.get(key)), fnum(prev.get(key)), AVG_THR)
+        if d:
+            tags.append(f"新規流入{side}{'↑' if d > 0 else '↓'}")
+
+    p = ref_price(cur)
+    al, as_ = fnum(cur.get("avg_long_price")), fnum(cur.get("avg_short_price"))
+
+    # 建値帯への接近と突破
+    if p is not None:
+        dists = [abs(p - a) for a in (al, as_) if a is not None]
+        if dists and min(dists) <= NEAR_DIST:
+            tags.append("建値帯に接近")
+        pp = ref_price(rows[i - 1]) if i >= 1 else None
+        pal = fnum(rows[i - 1].get("avg_long_price")) if i >= 1 else None
+        pas = fnum(rows[i - 1].get("avg_short_price")) if i >= 1 else None
+        for a, b, nm in ((al, pal, "L"), (as_, pas, "S")):
+            if None not in (a, b, p, pp) and (p - a) * (pp - b) < 0:
+                tags.append(f"建値帯を突破{nm}")
+
+    # 偏り極大：これまでの記録の最大／最小圏
+    nets = [fnum(r.get("net_vol_pct")) for r in rows[: i + 1]]
+    nets = [v for v in nets if v is not None]
+    n = fnum(cur.get("net_vol_pct"))
+    if n is not None and len(nets) >= 10:
+        if n >= max(nets):
+            tags.append("偏り極大（買い側）")
+        elif n <= min(nets):
+            tags.append("偏り極大（売り側）")
+
+    return {"label": label, "bias": bias, "desc": desc, "tags": tags}
+
+
+def verify(rows, judges):
+    """各判定の1点後の値動きと突き合わせる。(的中, 判定総数) のリスト"""
+    out = []
+    for i, j in enumerate(judges):
+        if not j or not j["bias"] or i + 1 >= len(rows):
+            continue
+        d = dir3(ref_price(rows[i + 1]), ref_price(rows[i]), PRICE_THR)
+        if not d:          # 価格が動いていない／判定不能はカウントしない
+            continue
+        out.append((d > 0) == (j["bias"] == "buy"))
+    return out
+
+
+def rate(hits):
+    if not hits:
+        return "集計中"
+    ok = sum(1 for h in hits if h)
+    return f"{ok}/{len(hits)}（{ok / len(hits) * 100:.0f}%）"
 
 
 def net_range(values):
@@ -135,10 +249,16 @@ for r in rows:
     by_inst[r.get("instrument", "?")].append(r)
 
 html = HEAD
-for inst, rs in by_inst.items():
-    raw_n = len(rs)
-    rs = collapse(rs)[-MAX_POINTS:]
-    print(f"{inst}: {raw_n} rows -> {len(rs)} points")
+for inst, all_rows in by_inst.items():
+    # 判定は全行で行う（検証の母数を減らさないため）
+    judges = [judge(all_rows, i) for i in range(len(all_rows))]
+    hits = verify(all_rows, judges)
+    cur = next((j for j in reversed(judges) if j), None)
+
+    # グラフは圧縮後の点を使う
+    rs = collapse(all_rows)[-MAX_POINTS:]
+    print(f"{inst}: {len(all_rows)} rows -> {len(rs)} points, "
+          f"judged {sum(1 for j in judges if j)}, verified {len(hits)}")
 
     last = rs[-1]
     labels = [
@@ -163,9 +283,26 @@ for inst, rs in by_inst.items():
     ls, lf = last_valid(spot), last_valid(fut)
     basis = f"／ 乖離 <b>{lf - ls:+.1f}</b>" if (ls is not None and lf is not None) else ""
 
+    # 含み損益（ドル）
+    la, sa = last_valid(avgl), last_valid(avgs)
+    pl = f"ロング勢 <b>{ls - la:+.1f}</b>" if (ls is not None and la is not None) else ""
+    ps = f"ショート勢 <b>{sa - ls:+.1f}</b>" if (ls is not None and sa is not None) else ""
+
+    if cur:
+        card = f"""<div class="card">
+<div class="label">【{cur['label']}】</div>
+<div class="tags">{'　'.join('［' + t + '］' for t in cur['tags']) or '－'}</div>
+<div class="note">{cur['desc']}<br>
+{pl}　{ps}<br>
+仮説の一致率：直近{RECENT_N}回 {rate(hits[-RECENT_N:])} ／ 全期間 {rate(hits)}</div>
+</div>"""
+    else:
+        card = '<div class="card"><div class="note">判定に必要なデータが不足しています。</div></div>'
+
     html += f"""<h2>{inst}</h2>
 <div class="val">{jst(last.get("snapshot_time",""))} JST ／ Net <b>{fmt(net[-1], 2)}</b>％ ／ スポット <b>{fmt(ls, 1)}</b> ／ 先物 {fmt(lf, 1)} {basis}<br>
 ロング {fmt(last.get("long_pct"), 1)}％・ショート {fmt(last.get("short_pct"), 1)}％ ／ 平均建値 L {fmt(last.get("avg_long_price"), 1)}・S {fmt(last.get("avg_short_price"), 1)}</div>
+{card}
 <div class="wrap"><canvas id="c_{inst}"></canvas></div>
 <script>
 new Chart(document.getElementById("c_{inst}"), {{
