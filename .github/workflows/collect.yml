@@ -2,7 +2,7 @@ name: collect-sentiment
 
 on:
   schedule:
-    -cron: "5,35 * * * *"
+    - cron: "5,35 * * * *"
   workflow_dispatch:
 
 permissions:
