@@ -4,26 +4,23 @@ from datetime import datetime, timedelta, timezone
 
 CSV_PATH = "positionbook.csv"
 OUT_DIR = "docs"
-MAX_POINTS = 336        # 畳んだ後の点数の上限
+MAX_POINTS = 336          # 畳んだ後の点数の上限
 JST = timezone(timedelta(hours=9))
-
-NET_MIN_SPAN = 6.0      # Net軸の最低表示幅（%）
-NET_PAD_RATIO = 0.15    # データ範囲に対する上下の余白比
-COLLAPSE_MIN = 3        # 同値がこの行数以上続いたら畳む／市場停止と見なす
-
-LOOKBACK = 3            # 何点前と比較するか
-VOL_THR = 0.02          # 建玉量が±2%動いたら「増減あり」
-PRICE_THR = 0.0015      # 価格が±0.15%動いたら「上下あり」（3本とも共通）
-AVG_THR = 0.0003        # 平均建値が±0.03%動いたら「動きあり」
-NEAR_DIST = 30.0        # 建値帯への接近と見なす距離（ドル）
-MIN_N_FOR_RATE = 20     # 母数がこれ未満のときは％を出さない
+NET_MIN_SPAN = 6.0        # Net軸の最低表示幅（%）
+NET_PAD_RATIO = 0.15      # データ範囲に対する上下の余白比
+COLLAPSE_MIN = 3          # 同値がこの行数以上続いたら畳む／市場停止と見なす
+LOOKBACK_HOURS = 3        # 何時間前と比較するか（旧仕様は「3点前」）
+LOOKBACK_TOL_MIN = 60     # 目標時刻より古い側に許容するズレ（分）＝1バケット
+VOL_THR = 0.02            # 建玉量が±2%動いたら「増減あり」
+PRICE_THR = 0.0015        # 価格が±0.15%動いたら「上下あり」（3本とも共通）
+AVG_THR = 0.0003          # 平均建値が±0.03%動いたら「動きあり」
+NEAR_DIST = 30.0          # 建値帯への接近と見なす距離（ドル）
+MIN_N_FOR_RATE = 20       # 母数がこれ未満のときは％を出さない
 
 # 検証ホライズン。採取が毎時なので 1行＝1時間
-# チャートで一般に使われる時間軸に合わせている
 HORIZONS = ((1, "1時間"), (4, "4時間"), (24, "1日"))
 
 # 無変化の判定に使う列。価格は含めない
-# （相場が止まっていてもスポットAPIが微差を返しうるため）
 STILL_KEYS = ("net_vol_pct", "avg_long_price", "avg_short_price")
 
 HEAD = """<!doctype html><html lang="ja"><head>
@@ -45,8 +42,7 @@ margin:8px 0 10px;border-radius:4px}
 border-top:1px solid #2a2a2a;line-height:1.6}
 .wrap{position:relative;height:54vh;margin-bottom:26px}
 b{color:#fff}
-</style></head><body>
-<div class="meta">Net＝(ロング数量−ショート数量)÷合計×100。プラスは買い持ち優勢。<br>
+</style></head><body><div class="meta">Net＝(ロング数量−ショート数量)÷合計×100。プラスは買い持ち優勢。<br>
 破線はリテールの平均建値（＝ストップが溜まりやすい帯）。価格はスポット基準。時刻はJST。<br>
 建玉が動かない時間帯（週末など）は圧縮表示。ラベルの「〜」は時間が飛んでいる箇所。<br>
 判定は「リテールと価格は逆相関する」という仮説に基づく検証用の表示です。</div>
@@ -153,8 +149,35 @@ def last_valid(seq):
     return None
 
 
-# ---------- 判定 ----------
+# ---------- 比較対象の決定 ----------
+def lookback_index(times, i):
+    """rows[i] の比較対象となる行の添字を返す。取れなければNone。
 
+    t_target = times[i] - LOOKBACK_HOURS とし、t_target 以下で最も新しい行を選ぶ。
+    後ろ向きに限ることで同着が発生せず、実効比較幅が3時間を下回ることもない。
+    ズレが LOOKBACK_TOL_MIN を超える場合は「比較幅の欠落」として判定しない。"""
+    t = times[i]
+    if t is None:
+        return None
+    target = t - timedelta(hours=LOOKBACK_HOURS)
+    for k in range(i - 1, -1, -1):
+        tk = times[k]
+        if tk is None:
+            continue
+        if tk <= target:
+            gap_min = (target - tk).total_seconds() / 60.0
+            return k if gap_min <= LOOKBACK_TOL_MIN else None
+    return None
+
+
+def eff_hours(times, i, p):
+    """実際に使われた比較幅（時間）。3.0 か 4.0 のどちらかになる"""
+    if p is None or times[i] is None or times[p] is None:
+        return None
+    return (times[i] - times[p]).total_seconds() / 3600.0
+
+
+# ---------- 判定 ----------
 def rel(cur, prev):
     """相対変化率を返す。判定不能はNone"""
     if cur is None or prev is None or prev == 0:
@@ -176,15 +199,15 @@ def dir3(cur, prev, thr):
 
 # (Δロング量, Δショート量) -> (ラベル, 想定方向, 説明)
 VERDICT = {
-    (1, 0):   ("売り目線", "sell", "買いが溜まっている＝下落の燃料"),
-    (1, -1):  ("売り目線（両側）", "sell", "買い増加かつ売り減少。偏りが加速"),
-    (0, 1):   ("買い目線", "buy", "売りが溜まっている＝上昇の燃料"),
-    (-1, 1):  ("買い目線（両側）", "buy", "売り増加かつ買い減少。偏りが加速"),
-    (-1, 0):  ("燃料消費・下落側", None, "ロングが投げている最中"),
-    (0, -1):  ("燃料消費・上昇側", None, "ショートが焼かれている最中"),
-    (1, 1):   ("対立激化", None, "総建玉が膨張。どちらかが必ず焼かれる"),
+    (1, 0): ("売り目線", "sell", "買いが溜まっている＝下落の燃料"),
+    (1, -1): ("売り目線（両側）", "sell", "買い増加かつ売り減少。偏りが加速"),
+    (0, 1): ("買い目線", "buy", "売りが溜まっている＝上昇の燃料"),
+    (-1, 1): ("買い目線（両側）", "buy", "売り増加かつ買い減少。偏りが加速"),
+    (-1, 0): ("燃料消費・下落側", None, "ロングが投げている最中"),
+    (0, -1): ("燃料消費・上昇側", None, "ショートが焼かれている最中"),
+    (1, 1): ("対立激化", None, "総建玉が膨張。どちらかが必ず焼かれる"),
     (-1, -1): ("手仕舞い", None, "両者が撤退。材料に乏しい"),
-    (0, 0):   ("動意なし", None, "建玉に目立った動きなし"),
+    (0, 0): ("動意なし", None, "建玉に目立った動きなし"),
 }
 
 
@@ -194,7 +217,7 @@ def flow_tag(side, d_avg, d_vol, price, avg):
     新規注文は現値で入るので、平均は必ず現値の側へ引かれる。"""
     if None in (d_avg, d_vol, price, avg) or d_avg == 0 or price == avg:
         return None
-    toward = (d_avg > 0) == (price > avg)   # 平均が現値へ近づいたか
+    toward = (d_avg > 0) == (price > avg)
     if toward and d_vol > 0:
         return f"新規流入{side}"
     if toward and d_vol < 0:
@@ -203,15 +226,14 @@ def flow_tag(side, d_avg, d_vol, price, avg):
         return f"{side}浅い建玉が撤退"
     if (not toward) and d_vol > 0:
         return f"{side}建値が現値と逆行"
-    return None   # 建玉量が横ばいのときは判断を保留
+    return None
 
 
-def judge(rows, i):
-    """rows[i] 時点の判定。判定不能ならNone"""
-    if i < LOOKBACK:
+def judge(rows, times, i, p):
+    """rows[i] 時点の判定。p は lookback_index の結果。判定不能ならNone"""
+    if p is None:
         return None
-    cur, prev = rows[i], rows[i - LOOKBACK]
-
+    cur, prev = rows[i], rows[p]
     rl = rel(fnum(cur.get("long_vol")), fnum(prev.get("long_vol")))
     rs_ = rel(fnum(cur.get("short_vol")), fnum(prev.get("short_vol")))
     if rl is None or rs_ is None:
@@ -223,8 +245,7 @@ def judge(rows, i):
     dl, ds = to_dir(rl), to_dir(rs_)
     label, bias, desc = VERDICT[(dl, ds)]
     tags = []
-
-    p = ref_price(cur)
+    pz = ref_price(cur)
     al, as_ = fnum(cur.get("avg_long_price")), fnum(cur.get("avg_short_price"))
 
     # 新規参入か手仕舞いかの切り分け
@@ -233,20 +254,20 @@ def judge(rows, i):
         ("avg_short_price", "S", as_, ds),
     ):
         d_avg = dir3(fnum(cur.get(key)), fnum(prev.get(key)), AVG_THR)
-        t = flow_tag(side, d_avg, dv, p, avg)
+        t = flow_tag(side, d_avg, dv, pz, avg)
         if t:
             tags.append(t)
 
-    # 建値帯への接近と突破
-    if p is not None:
-        dists = [abs(p - a) for a in (al, as_) if a is not None]
+    # 建値帯への接近と突破（突破は直前の1行との比較。今回は変更しない）
+    if pz is not None:
+        dists = [abs(pz - a) for a in (al, as_) if a is not None]
         if dists and min(dists) <= NEAR_DIST:
             tags.append("建値帯に接近")
         pp = ref_price(rows[i - 1]) if i >= 1 else None
         pal = fnum(rows[i - 1].get("avg_long_price")) if i >= 1 else None
         pas = fnum(rows[i - 1].get("avg_short_price")) if i >= 1 else None
         for a, b, nm in ((al, pal, "L"), (as_, pas, "S")):
-            if None not in (a, b, p, pp) and (p - a) * (pp - b) < 0:
+            if None not in (a, b, pz, pp) and (pz - a) * (pp - b) < 0:
                 tags.append(f"建値帯を突破{nm}")
 
     # 偏り極大：これまでの記録の最大／最小圏
@@ -260,13 +281,12 @@ def judge(rows, i):
             tags.append("偏り極大（売り側）")
 
     return {"label": label, "bias": bias, "desc": desc, "tags": tags,
-            "d_long": rl, "d_short": rs_}
+            "d_long": rl, "d_short": rs_,
+            "lb_hours": eff_hours(times, i, p)}
 
 
 def window_ok(i, k, h, times, frozen):
-    """判定時点iからk（=i+h）までの窓が検証に使えるかを見る。
-    ・欠測で行が飛んでいれば経過時間がh時間からずれる
-    ・週末など市場停止をまたぐ窓は、止まった価格と比較することになる"""
+    """判定時点iからk（=i+h）までの窓が検証に使えるかを見る。"""
     ti, tk = times[i], times[k]
     if ti is None or tk is None:
         return False
@@ -276,8 +296,7 @@ def window_ok(i, k, h, times, frozen):
 
 
 def verify(rows, judges, h, times, frozen):
-    """判定のh時間後の値動きと突き合わせる。
-    (的中リスト, 除外の内訳) を返す"""
+    """判定のh時間後の値動きと突き合わせる。(的中リスト, 除外の内訳) を返す"""
     out = []
     st = {"bias": 0, "pending": 0, "gap": 0, "flat": 0}
     for i, j in enumerate(judges):
@@ -288,13 +307,13 @@ def verify(rows, judges, h, times, frozen):
             continue
         k = i + h
         if k >= len(rows):
-            st["pending"] += 1      # まだ将来が確定していない
+            st["pending"] += 1
             continue
         if not window_ok(i, k, h, times, frozen):
             st["gap"] += 1
             continue
         d = dir3(ref_price(rows[k]), ref_price(rows[i]), PRICE_THR)
-        if not d:                   # 価格が動いていない／判定不能
+        if not d:
             st["flat"] += 1
             continue
         out.append((d > 0) == (j["bias"] == "buy"))
@@ -312,20 +331,23 @@ def rate(hits):
     return f"{ok}/{n}（{ok / n * 100:.0f}%）"
 
 
-def vol_stats(rows, key):
+def vol_stats(rows, times, lb_idx, key):
     """|Δ建玉| の分布。閾値VOL_THRが妥当かを見るための材料。
-    週末など完全に動かない点は除外する"""
+    判定と同じ比較規則を使う（ここを揃えないと診断行と判定がズレる）"""
     vals = []
-    for i in range(LOOKBACK, len(rows)):
-        r = rel(fnum(rows[i].get(key)), fnum(rows[i - LOOKBACK].get(key)))
+    for i in range(len(rows)):
+        p = lb_idx[i]
+        if p is None:
+            continue
+        r = rel(fnum(rows[i].get(key)), fnum(rows[p].get(key)))
         if r is not None and r != 0:
             vals.append(abs(r))
     if not vals:
         return None
     vals.sort()
 
-    def q(p):
-        return vals[min(len(vals) - 1, int(len(vals) * p))]
+    def q(pq):
+        return vals[min(len(vals) - 1, int(len(vals) * pq))]
 
     return {"n": len(vals), "med": q(0.5), "p75": q(0.75),
             "over": sum(1 for v in vals if v > VOL_THR)}
@@ -365,7 +387,7 @@ def load():
 
 
 rows = load()
-if not rows:  # 採取前でもPagesが404にならないように
+if not rows:
     save(HEAD + "<p>まだデータがありません。</p></body></html>")
     raise SystemExit(0)
 
@@ -376,11 +398,10 @@ for r in rows:
 
 html = HEAD
 for inst, all_rows in by_inst.items():
-    # 判定は全行で行う（検証の母数を減らさないため）
-    judges = [judge(all_rows, i) for i in range(len(all_rows))]
-    cur = next((j for j in reversed(judges) if j), None)
-
     times = [ts(r) for r in all_rows]
+    lb_idx = [lookback_index(times, i) for i in range(len(all_rows))]
+    judges = [judge(all_rows, times, i, lb_idx[i]) for i in range(len(all_rows))]
+    cur = next((j for j in reversed(judges) if j), None)
     frozen = frozen_flags(all_rows)
 
     res = {}
@@ -388,16 +409,26 @@ for inst, all_rows in by_inst.items():
         hits, st = verify(all_rows, judges, h, times, frozen)
         res[h] = {"hits": hits, "st": st}
 
+    n_all = len(all_rows)
     n_judged = sum(1 for j in judges if j)
+    n_lb_gap = sum(1 for x in lb_idx if x is None)
     n_bias = sum(1 for j in judges if j and j["bias"])
     n_frozen = sum(1 for f in frozen if f)
-    vsl = vol_stats(all_rows, "long_vol")
-    vss = vol_stats(all_rows, "short_vol")
 
-    # グラフは圧縮後の点を使う
+    # 実効比較幅の内訳（3.0時間／4.0時間）
+    eff = defaultdict(int)
+    for j in judges:
+        if j and j["lb_hours"] is not None:
+            eff[round(j["lb_hours"], 1)] += 1
+    eff_txt = " ／ ".join(f"{h:.1f}時間{c}点" for h, c in sorted(eff.items())) or "－"
+
+    vsl = vol_stats(all_rows, times, lb_idx, "long_vol")
+    vss = vol_stats(all_rows, times, lb_idx, "short_vol")
+
     rs = collapse(all_rows)[-MAX_POINTS:]
     print(f"{inst}: {len(all_rows)} rows -> {len(rs)} points, "
-          f"judged {n_judged}, bias {n_bias}, frozen {n_frozen}")
+          f"judged {n_judged}, lb_gap {n_lb_gap}, bias {n_bias}, frozen {n_frozen}")
+    print(f"  effective lookback: {eff_txt}")
     for h, name in HORIZONS:
         s = res[h]["st"]
         print(f"  {name}: verified {len(res[h]['hits'])}, "
@@ -419,18 +450,14 @@ for inst, all_rows in by_inst.items():
     fut = [p[1] for p in pairs]
     avgl = [fnum(r.get("avg_long_price")) for r in rs]
     avgs = [fnum(r.get("avg_short_price")) for r in rs]
-
     ymin, ymax = net_range(net)
-    pr = 3 if len(rs) < 8 else 0   # 点が少ないうちはマーカーを出す
+    pr = 3 if len(rs) < 8 else 0
 
     ls, lf = last_valid(spot), last_valid(fut)
     basis = f"／ 乖離 <b>{lf - ls:+.1f}</b>" if (ls is not None and lf is not None) else ""
-
-    # 含み損益（ドル）
     la, sa = last_valid(avgl), last_valid(avgs)
     pl = f"ロング勢 <b>{ls - la:+.1f}</b>" if (ls is not None and la is not None) else ""
     ps = f"ショート勢 <b>{sa - ls:+.1f}</b>" if (ls is not None and sa is not None) else ""
-
     hz_txt = " ／ ".join(f"{name} {rate(res[h]['hits'])}" for h, name in HORIZONS)
     diag_hz = "<br>".join(
         f"　{name}後：検証<b>{len(res[h]['hits'])}</b>点"
@@ -443,12 +470,13 @@ for inst, all_rows in by_inst.items():
     if cur:
         card = f"""<div class="card">
 <div class="label">【{cur['label']}】</div>
-<div class="tags">{'　'.join('［' + t + '］' for t in cur['tags']) or '－'}</div>
+<div class="tags">{' '.join('［' + t + '］' for t in cur['tags']) or '－'}</div>
 <div class="note">{cur['desc']}<br>
-Δ建玉（{LOOKBACK}点前比・閾値±{VOL_THR * 100:.0f}%）：ロング <b>{pct(cur['d_long'], 2)}</b>　ショート <b>{pct(cur['d_short'], 2)}</b><br>
+Δ建玉（{LOOKBACK_HOURS}時間前比・閾値±{VOL_THR * 100:.0f}%）：ロング <b>{pct(cur['d_long'], 2)}</b>　ショート <b>{pct(cur['d_short'], 2)}</b><br>
 {pl}　{ps}<br>
 仮説の一致率：{hz_txt}</div>
-<div class="diag">検証の内訳：判定{n_judged}点（うち市場停止{n_frozen}点） → 方向あり{n_bias}点<br>
+<div class="diag">検証の内訳：判定{n_all}点（うち市場停止{n_frozen}点／比較幅の欠落{n_lb_gap}点） → 方向あり{n_bias}点<br>
+実効比較幅：{eff_txt}<br>
 {diag_hz}<br>
 |Δ建玉|の分布（動きのあった点のみ）：{stat_line(vsl, 'L')} ／ {stat_line(vss, 'S')}</div>
 </div>"""
@@ -462,29 +490,29 @@ for inst, all_rows in by_inst.items():
 <div class="wrap"><canvas id="c_{inst}"></canvas></div>
 <script>
 new Chart(document.getElementById("c_{inst}"), {{
-type:"line",
-data:{{ labels:{json.dumps(labels, ensure_ascii=False)}, datasets:[
-{{label:"Net (L-S) %", data:{json.dumps(net)}, yAxisID:"y",
-borderColor:"#4ea1ff", borderWidth:2, pointRadius:{pr}, tension:.2, spanGaps:true}},
-{{label:"スポット", data:{json.dumps(spot)}, yAxisID:"y1",
-borderColor:"#ffb74d", borderWidth:1.8, pointRadius:{pr}, tension:.2, spanGaps:true}},
-{{label:"先物 GC=F", data:{json.dumps(fut)}, yAxisID:"y1",
-borderColor:"#a1793c", borderWidth:1.2, borderDash:[2,3], pointRadius:0,
-tension:.2, spanGaps:true}},
-{{label:"平均L建値", data:{json.dumps(avgl)}, yAxisID:"y1",
-borderColor:"#66bb6a", borderWidth:1, borderDash:[4,3], pointRadius:0, spanGaps:true}},
-{{label:"平均S建値", data:{json.dumps(avgs)}, yAxisID:"y1",
-borderColor:"#ef5350", borderWidth:1, borderDash:[4,3], pointRadius:0, spanGaps:true}}]}},
-options:{{ responsive:true, maintainAspectRatio:false,
-interaction:{{mode:"index",intersect:false}},
-scales:{{
-x:{{ticks:{{color:"#888",maxTicksLimit:6,maxRotation:0}},grid:{{color:"#222"}}}},
-y:{{position:"left",min:{ymin},max:{ymax},ticks:{{color:"#4ea1ff"}},
-grid:{{color:c=>c.tick.value===0?"#666":"#222"}}}},
-y1:{{position:"right",ticks:{{color:"#ffb74d"}},grid:{{drawOnChartArea:false}}}}
-}},
-plugins:{{legend:{{labels:{{color:"#ccc",boxWidth:12,font:{{size:11}}}}}}}}
-}}
+  type:"line",
+  data:{{ labels:{json.dumps(labels, ensure_ascii=False)}, datasets:[
+    {{label:"Net (L-S) %", data:{json.dumps(net)}, yAxisID:"y",
+      borderColor:"#4ea1ff", borderWidth:2, pointRadius:{pr}, tension:.2, spanGaps:true}},
+    {{label:"スポット", data:{json.dumps(spot)}, yAxisID:"y1",
+      borderColor:"#ffb74d", borderWidth:1.8, pointRadius:{pr}, tension:.2, spanGaps:true}},
+    {{label:"先物 GC=F", data:{json.dumps(fut)}, yAxisID:"y1",
+      borderColor:"#a1793c", borderWidth:1.2, borderDash:[2,3], pointRadius:0,
+      tension:.2, spanGaps:true}},
+    {{label:"平均L建値", data:{json.dumps(avgl)}, yAxisID:"y1",
+      borderColor:"#66bb6a", borderWidth:1, borderDash:[4,3], pointRadius:0, spanGaps:true}},
+    {{label:"平均S建値", data:{json.dumps(avgs)}, yAxisID:"y1",
+      borderColor:"#ef5350", borderWidth:1, borderDash:[4,3], pointRadius:0, spanGaps:true}}]}},
+  options:{{ responsive:true, maintainAspectRatio:false,
+    interaction:{{mode:"index",intersect:false}},
+    scales:{{
+      x:{{ticks:{{color:"#888",maxTicksLimit:6,maxRotation:0}},grid:{{color:"#222"}}}},
+      y:{{position:"left",min:{ymin},max:{ymax},ticks:{{color:"#4ea1ff"}},
+        grid:{{color:c=>c.tick.value===0?"#666":"#222"}}}},
+      y1:{{position:"right",ticks:{{color:"#ffb74d"}},grid:{{drawOnChartArea:false}}}}
+    }},
+    plugins:{{legend:{{labels:{{color:"#ccc",boxWidth:12,font:{{size:11}}}}}}}}
+  }}
 }});
 </script>
 """
