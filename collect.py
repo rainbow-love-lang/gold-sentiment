@@ -9,10 +9,9 @@ import requests
 EMAIL = os.environ["MYFXBOOK_EMAIL"].strip()
 PASSWORD = os.environ["MYFXBOOK_PASSWORD"].strip()
 BASE = "https://www.myfxbook.com/api"
-SYMBOLS = ["XAUUSD"]          # 増やすならここに追記
+SYMBOLS = ["XAUUSD"]  # 増やすならここに追記
 CSV_PATH = "positionbook.csv"
-
-MAX_PRICE_AGE_SEC = 900       # 価格がこれより古ければ採用しない（15分）
+MAX_PRICE_AGE_SEC = 900  # 価格がこれより古ければ採用しない（15分）
 
 UA = {"User-Agent": "gold-sentiment/1.0"}
 BROWSER = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -24,6 +23,7 @@ SPOT_SOURCES = {
     "XAUUSD": [("xaus", "XAU"), ("yahoo", "XAUUSD=X"), ("stooq", "xauusd")],
     "XAGUSD": [("xaus", "XAG"), ("yahoo", "XAGUSD=X"), ("stooq", "xagusd")],
 }
+
 # 先物価格（参考値・乖離の実測用）
 FUT_SOURCES = {
     "XAUUSD": [("yahoo", "GC=F")],
@@ -48,7 +48,7 @@ def api(path, params, attempts=3):
             r = requests.get(f"{BASE}/{path}", params=params, headers=UA, timeout=20)
             r.raise_for_status()
             d = r.json()
-        except Exception as e:       # JSONでない応答もここで捕まる
+        except Exception as e:  # JSONでない応答もここで捕まる
             last = e
             print(f"[retry {i}/{attempts}] {path}: {e}")
             time.sleep(5 * i)
@@ -111,12 +111,10 @@ def price_xaus(code):
     state = (d.get("data_state") or {}).get("status")
     if state == "unavailable":
         raise RuntimeError("upstream unavailable")
-
     field = {"XAU": "spot_usd_oz", "XAG": "silver_usd_oz"}.get(code)
     v = d.get(field)
     if v is None:
         raise RuntimeError(f"{field} missing")
-
     age = _age_sec(d.get("price_as_of") or d.get("updated_at"))
     if age is not None and age > MAX_PRICE_AGE_SEC:
         raise RuntimeError(f"stale {int(age)}s")
@@ -180,7 +178,7 @@ def save(new_rows):
     keys = {(r.get("instrument"), r.get("snapshot_time")) for r in old}
     fresh = [r for r in new_rows if (r["instrument"], r["snapshot_time"]) not in keys]
 
-    if header and header != FIELDS:      # 列構成を変えた場合は自動で詰め替え
+    if header and header != FIELDS:  # 列構成を変えた場合は自動で詰め替え
         print("[info] schema changed -> rewriting csv")
         merged = [{k: r.get(k, "") for k in FIELDS} for r in old] + fresh
         with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
@@ -194,7 +192,7 @@ def save(new_rows):
 
     with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
-        if not header:                   # ヘッダ二重書き込みを防ぐ
+        if not header:  # ヘッダ二重書き込みを防ぐ
             w.writeheader()
         w.writerows(fresh)
     return len(fresh)
@@ -204,6 +202,15 @@ def main():
     now = datetime.now(timezone.utc)
     stamp = now.replace(minute=0, second=0,
                         microsecond=0).isoformat(timespec="seconds")
+
+    # このバケットが全銘柄そろっていれば、Myfxbookを呼ばずに終了する。
+    # get-community-outlook は無料枠で24時間100リクエスト。
+    # これにより消費は起動回数ではなくバケット数（1日最大24回）に固定される。
+    _, existing = read_existing()
+    filled = {(r.get("instrument"), r.get("snapshot_time")) for r in existing}
+    if all((inst, stamp) in filled for inst in SYMBOLS):
+        print(f"[skip] bucket {stamp} already filled")
+        return
 
     session = login()
     try:
@@ -237,25 +244,24 @@ def main():
         if spot != "" and fut != "":
             print(f"basis {inst}: fut-spot = {round(fut - spot, 2)}")
 
-        rows.append({
-            "snapshot_time": stamp,
-            "instrument": inst,
-            "price": spot,
-            "price_fut": fut,
-            "price_src": src,
-            "long_pct": lo,
-            "short_pct": sh,
-            "net_pct": round(lo - sh, 2),
-            "long_ratio": round(lo / tot * 100, 2) if tot else "",
-            "long_vol": lv if lv is not None else "",
-            "short_vol": sv if sv is not None else "",
-            "net_vol_pct": net_vol,
-            "long_positions": x.get("longPositions", ""),
-            "short_positions": x.get("shortPositions", ""),
-            "avg_long_price": x.get("avgLongPrice", ""),
-            "avg_short_price": x.get("avgShortPrice", ""),
-            "fetched_at": now.isoformat(timespec="seconds"),
-        })
+        rows.append({"snapshot_time": stamp,
+                     "instrument": inst,
+                     "price": spot,
+                     "price_fut": fut,
+                     "price_src": src,
+                     "long_pct": lo,
+                     "short_pct": sh,
+                     "net_pct": round(lo - sh, 2),
+                     "long_ratio": round(lo / tot * 100, 2) if tot else "",
+                     "long_vol": lv if lv is not None else "",
+                     "short_vol": sv if sv is not None else "",
+                     "net_vol_pct": net_vol,
+                     "long_positions": x.get("longPositions", ""),
+                     "short_positions": x.get("shortPositions", ""),
+                     "avg_long_price": x.get("avgLongPrice", ""),
+                     "avg_short_price": x.get("avgShortPrice", ""),
+                     "fetched_at": now.isoformat(timespec="seconds"),
+                     })
         print(f"{inst}: L{lo}/S{sh} netVol {net_vol} "
               f"avgL {x.get('avgLongPrice')} avgS {x.get('avgShortPrice')}")
 
