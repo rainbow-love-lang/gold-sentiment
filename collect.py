@@ -1,7 +1,9 @@
 import csv
+import json
 import os
+import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote
 
 import requests
@@ -12,6 +14,14 @@ BASE = "https://www.myfxbook.com/api"
 SYMBOLS = ["XAUUSD"]  # 増やすならここに追記
 CSV_PATH = "positionbook.csv"
 MAX_PRICE_AGE_SEC = 900  # 価格がこれより古ければ採用しない（15分）
+
+# ---- バックオフ（採取に失敗したとき、自分から間隔を空けるための設定）----
+STATE_PATH = "collect_state.json"   # 連続失敗回数と、次に試してよい時刻
+LOG_PATH = "login_log.csv"          # 診断用。Myfxbookを叩いた記録
+LOG_KEEP = 300                      # ログはこの行数だけ保持する
+LOG_FIELDS = ["attempted_at", "result", "message", "fail_count", "forced"]
+BACKOFF_MIN = {1: 30, 2: 120, 3: 360}   # 連続失敗回数 -> 次に試すまでの分
+BACKOFF_MAX_MIN = 360                   # 4回目以降の上限（6時間）
 
 UA = {"User-Agent": "gold-sentiment/1.0"}
 BROWSER = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -40,6 +50,24 @@ FIELDS = [
 ]
 
 
+class ApiRejected(RuntimeError):
+    """APIが error=true を返した（＝Myfxbookに拒否された）"""
+
+    def __init__(self, path, message):
+        self.path = path
+        self.message = message
+        super().__init__(f"{path} failed: {message}")
+
+
+class ApiUnreachable(RuntimeError):
+    """通信そのものが成立しなかった（接続不能・5xx・JSONでない応答）"""
+
+    def __init__(self, path, last):
+        self.path = path
+        self.last = last
+        super().__init__(f"{path} unreachable: {last}")
+
+
 def api(path, params, attempts=3):
     """通信エラー・5xxのみリトライ。API側のerror=trueは即中断（無駄撃ち防止）。"""
     last = None
@@ -54,9 +82,9 @@ def api(path, params, attempts=3):
             time.sleep(5 * i)
             continue
         if str(d.get("error")).lower() == "true":
-            raise RuntimeError(f"{path} failed: {d.get('message')}")
+            raise ApiRejected(path, d.get("message"))
         return d
-    raise RuntimeError(f"{path} unreachable: {last}")
+    raise ApiUnreachable(path, last)
 
 
 def login():
@@ -77,6 +105,94 @@ def logout(session):
 
 def outlook(session):
     return api("get-community-outlook.json", {"session": session}).get("symbols") or []
+
+
+# ---------- バックオフの状態管理 ----------
+
+def parse_iso(s):
+    """ISO8601文字列をaware datetimeにする。読めなければNone"""
+    try:
+        t = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def write_state(fail_count, next_try_at):
+    """内容が同じなら毎回同じバイト列になるように書く（無駄なコミットを避ける）"""
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump({"fail_count": fail_count, "next_try_at": next_try_at},
+                  f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def read_state():
+    """読めないときは必ず「試してよい」を返す。状態ファイルの不具合で採取を止めない"""
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        fc = int(d.get("fail_count") or 0)
+        return {"fail_count": max(fc, 0), "next_try_at": d.get("next_try_at") or None}
+    except Exception as e:
+        print(f"[warn] state unreadable -> treat as ok to try: {e}")
+        return {"fail_count": 0, "next_try_at": None}
+
+
+def ensure_files():
+    """初回実行で確実に作る。存在しないファイルを git add すると失敗するため"""
+    if not os.path.exists(STATE_PATH):
+        write_state(0, None)
+        print(f"[info] created {STATE_PATH}")
+    if not os.path.exists(LOG_PATH) or os.path.getsize(LOG_PATH) == 0:
+        with open(LOG_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=LOG_FIELDS).writeheader()
+        print(f"[info] created {LOG_PATH}")
+
+
+def append_log(now, result, message, fail_count, forced):
+    """Myfxbookを叩いた記録を1行足し、直近LOG_KEEP行だけ残す"""
+    rows = []
+    try:
+        with open(LOG_PATH, newline="", encoding="utf-8") as f:
+            rows = [{k: r.get(k, "") for k in LOG_FIELDS} for r in csv.DictReader(f)]
+    except Exception as e:
+        print(f"[warn] log unreadable -> recreating: {e}")
+        rows = []
+
+    rows.append({"attempted_at": now.isoformat(timespec="seconds"),
+                 "result": result,
+                 "message": str(message or "")[:300],
+                 "fail_count": fail_count,
+                 "forced": "1" if forced else "0"})
+    rows = rows[-LOG_KEEP:]
+
+    with open(LOG_PATH, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def finish_failure(state, now, forced, result, message):
+    """バケットを埋められずに終わった。原因を問わず連続失敗回数を進める"""
+    fc = state["fail_count"] + 1
+    wait = BACKOFF_MIN.get(fc, BACKOFF_MAX_MIN)
+    nxt = (now + timedelta(minutes=wait)).isoformat(timespec="seconds")
+    write_state(fc, nxt)
+    append_log(now, result, message, fc, forced)
+    print(f"[fail] {result}: {message}")
+    print(f"[backoff] consecutive failures {fc} -> next attempt after {nxt} (+{wait}min)")
+
+
+def finish_success(state, now, forced):
+    write_state(0, None)
+    append_log(now, "ok", "", 0, forced)
+    if state["fail_count"]:
+        print(f"[recover] failure counter {state['fail_count']} -> 0")
+
+
+def forced_run():
+    """collect.yml の workflow_dispatch 入力から渡る。外部スケジューラは送らないのでfalse"""
+    return os.environ.get("FORCE_LOGIN", "").strip().lower() in ("true", "1", "yes", "on")
 
 
 # ---------- 価格取得 ----------
@@ -198,25 +314,28 @@ def save(new_rows):
     return len(fresh)
 
 
-def main():
-    now = datetime.now(timezone.utc)
-    stamp = now.replace(minute=0, second=0,
-                        microsecond=0).isoformat(timespec="seconds")
-
-    # このバケットが全銘柄そろっていれば、Myfxbookを呼ばずに終了する。
-    # get-community-outlook は無料枠で24時間100リクエスト。
-    # これにより消費は起動回数ではなくバケット数（1日最大24回）に固定される。
-    _, existing = read_existing()
-    filled = {(r.get("instrument"), r.get("snapshot_time")) for r in existing}
-    if all((inst, stamp) in filled for inst in SYMBOLS):
-        print(f"[skip] bucket {stamp} already filled")
-        return
-
-    session = login()
+def collect(state, now, stamp, filled, forced):
+    """Myfxbookを叩いて1バケット分を埋める。埋められなければ終了コード1で抜ける"""
     try:
-        symbols = outlook(session)
-    finally:
-        logout(session)
+        session = login()
+    except ApiRejected as e:
+        finish_failure(state, now, forced, "login_rejected", e.message)
+        sys.exit(1)
+    except ApiUnreachable as e:
+        finish_failure(state, now, forced, "login_unreachable", e.last)
+        sys.exit(1)
+
+    try:
+        try:
+            symbols = outlook(session)
+        finally:
+            logout(session)
+    except ApiRejected as e:
+        finish_failure(state, now, forced, "outlook_rejected", e.message)
+        sys.exit(1)
+    except ApiUnreachable as e:
+        finish_failure(state, now, forced, "outlook_unreachable", e.last)
+        sys.exit(1)
 
     found = {s.get("name"): s for s in symbols}
     print(f"symbols fetched: {len(found)}")
@@ -266,6 +385,54 @@ def main():
               f"avgL {x.get('avgLongPrice')} avgS {x.get('avgShortPrice')}")
 
     print(f"added {save(rows)} rows")
+
+    # 応答は返ったが行を作れなかった銘柄があれば、それも「バケットを埋められなかった」扱い。
+    # ここを緑で通すと、スキップ機構が効かないまま叩き続ける輪に戻る
+    got = {r["instrument"] for r in rows}
+    missing = [i for i in SYMBOLS if i not in got and (i, stamp) not in filled]
+    if missing:
+        finish_failure(state, now, forced, "no_symbol", "missing: " + ", ".join(missing))
+        sys.exit(1)
+
+    finish_success(state, now, forced)
+
+
+def main():
+    ensure_files()
+
+    now = datetime.now(timezone.utc)
+    stamp = now.replace(minute=0, second=0,
+                        microsecond=0).isoformat(timespec="seconds")
+
+    # このバケットが全銘柄そろっていれば、Myfxbookを呼ばずに終了する。
+    # get-community-outlook は無料枠で24時間100リクエスト。
+    # これにより消費は起動回数ではなくバケット数（1日最大24回）に固定される。
+    _, existing = read_existing()
+    filled = {(r.get("instrument"), r.get("snapshot_time")) for r in existing}
+    if all((inst, stamp) in filled for inst in SYMBOLS):
+        print(f"[skip] bucket {stamp} already filled")
+        return
+
+    # 前回までに連続失敗していれば、待ち時間が明けるまでMyfxbookを呼ばない。
+    # 手動起動で FORCE_LOGIN=true を渡したときだけ、この待ちを飛ばす
+    state = read_state()
+    forced = forced_run()
+    nxt = parse_iso(state["next_try_at"]) if state["next_try_at"] else None
+    if nxt and now < nxt:
+        if forced:
+            print(f"[force] backoff until {state['next_try_at']} bypassed by manual run")
+        else:
+            wait = int((nxt - now).total_seconds() // 60)
+            print(f"[backoff] waiting until {state['next_try_at']} "
+                  f"({wait}min left, consecutive failures {state['fail_count']}) "
+                  f"-> skip without calling Myfxbook")
+            return
+
+    try:
+        collect(state, now, stamp, filled, forced)
+    except Exception as e:  # 想定外の例外でも輪に戻らないよう、必ず間隔を空ける
+        finish_failure(state, now, forced, "error", f"{type(e).__name__}: {e}")
+        raise
 
 
 if __name__ == "__main__":
