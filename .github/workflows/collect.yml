@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "5,35 * * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "バックオフの待ち時間を無視して即座に試す"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -33,16 +38,22 @@ jobs:
         env:
           MYFXBOOK_EMAIL:    ${{ secrets.MYFXBOOK_EMAIL }}
           MYFXBOOK_PASSWORD: ${{ secrets.MYFXBOOK_PASSWORD }}
+          # 画面から Run workflow で起動したときだけ true が入る。
+          # cron-job.org は inputs を送らないので既定の false になる
+          FORCE_LOGIN:       ${{ inputs.force }}
         run: python collect.py
 
       - name: Plot
         run: python plot.py
 
       - name: Commit & push
+        # Collect が失敗しても状態ファイルとログを保存する。
+        # always() と違い、キャンセルされた実行では走らない
+        if: ${{ !cancelled() }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add positionbook.csv docs/index.html docs/.nojekyll
+          git add positionbook.csv docs/index.html docs/.nojekyll collect_state.json login_log.csv
           if git diff --staged --quiet; then
             echo "no changes"; exit 0
           fi
