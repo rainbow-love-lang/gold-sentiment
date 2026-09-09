@@ -3,3 +3,4 @@ attempted_at,result,message,fail_count,forced
 2026-09-08T18:40:35+00:00,login_rejected,Wrong email/password.,2,0
 2026-09-08T20:40:38+00:00,login_rejected,Wrong email/password.,3,0
 2026-09-09T03:00:52+00:00,ok,,0,0
+2026-09-09T04:00:51+00:00,outlook_rejected,Invalid session.,1,0
