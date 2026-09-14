@@ -27,3 +27,4 @@ attempted_at,result,message,fail_count,forced
 2026-09-13T08:00:52+00:00,login_rejected,Wrong email/password.,18,0
 2026-09-13T14:00:53+00:00,login_rejected,Wrong email/password.,19,0
 2026-09-13T20:20:37+00:00,login_rejected,Wrong email/password.,20,0
+2026-09-14T02:40:33+00:00,login_rejected,Wrong email/password.,21,0
